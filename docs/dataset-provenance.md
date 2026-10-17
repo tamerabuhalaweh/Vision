@@ -1,0 +1,48 @@
+# Dataset Provenance Framework (G2)
+
+Status: framework + owner questionnaire; NO training on any public dataset without cleared rights.
+
+## Starting position (recorded 2026-10-17)
+
+Candidate datasets named by the owner and their current legal posture:
+
+| Dataset | Card/source posture | Training decision |
+|---|---|---|
+| AnonMegumi/InstanceVid | references OpenVid-derived content | NOT cleared; research-only by reference lineage |
+| multimodalart/panda-70m | Snap/panda original restrictions; non-commercial research lineage | NOT cleared |
+| nkp37/OpenVid-1M | card states research/non-commercial; mixed third-party rights | NOT cleared |
+
+Rule adopted: **no commercially unclear video enters LoRA training.** Public research sets may be
+used only for INFRASTRUCTURE/captioner smoke tests if licensing permits that specific use at all;
+default = no download of terabyte-scale sets.
+
+## What we WILL train on
+
+Owned or explicitly licensed footage from the owner (product b-roll, produced lifestyle shots,
+stock licenses that permit ML training, or team-shot material). Target pool: **150–500 clips**,
+stratified: product macro, product-in-hand, lifestyle, people/hands, camera moves (orbit, push,
+handheld), lighting styles. Captions written by the self-hosted Qwen3-Omni captioner and reviewed
+by a human pass; long videos auto-split into scenes.
+
+One label-schema JSON per clip (adapted from the official trainer's metadata columns) is generated
+by `scripts/dataset_manifest.py` (to follow) computing: source path, sha256, duration, fps,
+resolution, codec, caption, license statement, and rights-url/owner-signed license-reference.
+
+## Train / holdout policy
+
+- Minimum 90% train / 10% holdout by strata. Holdout NEVER participates in preprocessing caches.
+- Identical scene extraction, resize bucketing [544x960x49], frame-normalized 24fps inputs.
+- Report per-prep times; any sample skipped (short/out-of-bucket) is logged in the manifest.
+
+## Preparing footage (owner checklist)
+
+1. Put clips under the server: `/data/vision-work/dataset/owner-videos/` (we never touch other
+   `/data` contents). Provide an approximate count, total minutes, and where they came from.
+2. For licensed stock, include the license tier + invoice/order refs offline (owner keeps proof).
+3. Watermarked/unpaid stock is NEVER acceptable as LoRA training content.
+
+## Open question on the (public) 'hard scenes'
+
+Social-ad shots often want text overlays/native audio. Captions must verbally describe in-shot
+lettering (the model will not reliably reproduce brand typography); the LTX prompting guide
+recommends literal, cinematographic descriptions ≤200 words, flowing chronologically.
