@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
+"""Append-only HF checkpoint uploader — see docs/checkpoint-recovery.md.
+
+Revised per issue #9:
+- --dry-run is fully OFFLINE and runs before any token check or hub import.
+- Single atomic upload via HfApi.create_commit with parent_commit optimistic
+  concurrency guard; NO auto-retry of an uncertain commit (operator reinstates
+  with a fresh unique prefix; nothing is ever overwritten or deleted).
+- Files referenced directly by CommitOperationAdd path (no staging copies);
+  manifest.json is generated in a temp dir outside the source checkpoint dir.
+- Remote verification: info.size (fallback info.lfs.size), treat size=0 valid,
+  validate LFS sha256 when present, and download+re-hash manifest.json.
+- Fail closed on: missing/invalid token, non-private repo, existing remote
+  prefix, symlinked entries, unapproved file suffixes, failed verification.
+- Error text is sanitized (no tokens, truncated); audit log stored outside the
+  source repo (VISION_AUDIT_DIR or $HOME/vision-audit/upload-audit.jsonl).
+
+Exit codes: 0 verified; 2 local/fs; 3 remote/uncertain; 4 missing token.
 """
-Append-only Hugging Face checkpoint uploader (see docs/checkpoint-recovery.md).
+from __future__ import annotations
 
-Usage:
-  python hf_checkpoint_uploader.py --repo-id TamerITIS/vision-social-video-YYYYMMDD-abc123 \
-      --step-dir /path/to/trainer/checkpoint_dir --step 250 --run-id abc123 \
-      [--tag adapter|state] [--dry-run]
-
-Env (required, never stored on disk):
-  HUGGING_FACE_HUB_TOKEN  (or HF_TOKEN)
-
-Guarantees:
-- Refuses to touch anything if the remote target directory already contains files
-  (append-only; a retry uses a new -rN suffix instead of overwriting).
-- Uploads a manifest.json with sha256 of every file.
-- Verifies after upload (path list + sizes); prints UPLOAD_VERIFIED or FAILED.
-- Exits 0 on verified success; 2 fs missing; 3 remote/API error; 4 missing token.
-"""
 import argparse
 import hashlib
 import json
@@ -24,19 +26,25 @@ import os
 import sys
 import tempfile
 import time
-import shutil
+import uuid
 from pathlib import Path
 
-RETRY_ATTEMPTS = 3
-RETRY_BACKOFF = 20.0
-AUDIT_LOG = Path("upload-audit.jsonl")
+APPROVED_SUFFIXES = {
+    ".safetensors", ".pt", ".pth", ".json", ".yaml", ".yml", ".txt",
+    ".md", ".mp4", ".png", "_config.json", ".log",
+}
+CHUNK = 1 << 20
 
 
-def sha256(path: Path, chunk: int = 1 << 20) -> str:
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
         while True:
-            block = f.read(chunk)
+            block = f.read(CHUNK)
             if not block:
                 break
             h.update(block)
@@ -44,19 +52,144 @@ def sha256(path: Path, chunk: int = 1 << 20) -> str:
 
 
 def human(n: int) -> str:
+    n = float(n)
     for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.1f}{unit}" if unit != "B" else f"{n}B"
+        if abs(n) < 1024 or unit == "GB":
+            return f"{n:.1f}{unit}"
         n /= 1024.0
     return f"{n:.1f}GB"
 
 
-def die(code: int, msg: str):
-    print(f"FAILED {msg}", flush=True)
-    sys.exit(code)
+def redact(text: str, secrets: list[str]) -> str:
+    out = str(text)
+    for s in secrets or []:
+        if s and s in out:
+            out = out.replace(s, "<redacted>")
+    return out[:300]
 
 
-def main() -> None:
+def detect_prefix_clash(existing_keys: list[str], prefix: str) -> list[str]:
+    return [k for k in existing_keys if k.startswith(prefix.rstrip("/") + "/")]
+
+
+def extract_remote_size(info) -> "int | None":
+    """Remote size from RepoPathInfo: info.size primary, info.lfs.size fallback.
+
+    None means 'unknown' (caller decides fail-closed). size=0 is valid.
+    """
+    size = getattr(info, "size", None)
+    if size is None:
+        lfs = getattr(info, "lfs", None)
+        if lfs is not None:
+            size = getattr(lfs, "size", None)
+    if isinstance(size, (int, float)):
+        return int(size)
+    return None
+
+
+def collect_files(step_dir: Path) -> list[Path]:
+    """Fail-closed local file collection (symlinks, unapproved suffixes)."""
+    if not step_dir.is_dir():
+        raise FileNotFoundError(f"{step_dir}")
+    for p in step_dir.iterdir():
+        if p.is_symlink():
+            raise ValueError(f"SYMLINK_REFUSED {p.name}")
+    files = []
+    for p in sorted(step_dir.iterdir()):
+        if not p.is_file():
+            continue
+        if p.name.lower() == "manifest.json":
+            raise ValueError("MANIFEST_IN_SOURCE_REFUSED manifest.json must not pre-exist in step dir")
+        if p.suffix.lower() not in APPROVED_SUFFIXES:
+            raise ValueError(f"UNAPPROVED_SUFFIX {p.name}")
+        files.append(p)
+    if not files:
+        raise FileNotFoundError("NO_UPLOADABLE_FILES")
+    return files
+
+
+def build_manifest(run_id: str, step: int, tag: str, repo_id: str,
+                   files: list[Path], step_dir: Path,
+                   extra: dict | None = None) -> dict:
+    return {
+        "run_id": run_id,
+        "step": step,
+        "tag": tag,
+        "repo_id": repo_id,
+        "source_dir": str(step_dir),
+        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "attempt_id": uuid.uuid4().hex[:8],
+        "files": [
+            {
+                "name": p.name,
+                "size": p.stat().st_size,
+                "sha256": sha256_file(p),
+            }
+            for p in files
+        ],
+        "extra": extra or {},
+    }
+
+
+def verify_remote(api, repo_id: str, prefix: str, entries: list[dict],
+                  manifest_expected_sha: str, secrets: list[str]) -> bool:
+    """Verify remote paths+sizes (+LFS sha when provided) and manifest re-hash."""
+    infos = api.get_paths_info(
+        repo_id=repo_id, repo_type="model",
+        paths=[f"{prefix}/{e['name']}" for e in entries],
+    )
+    info_by_path = {getattr(i, "path", None): i for i in infos}
+    for e in entries:
+        path = f"{prefix}/{e['name']}"
+        info = info_by_path.get(path)
+        if info is None:
+            log(f"VERIFY_MISSING {e['name']}")
+            return False
+        got = extract_remote_size(info)
+        if got is None:
+            log(f"VERIFY_UNCOUNTED {e['name']}")
+            return False
+        if got != int(e["size"]):
+            log(f"VERIFY_SIZE_MISMATCH {e['name']} want={e['size']} got={got}")
+            return False
+        lfs = getattr(info, "lfs", None)
+        lfs_sha = getattr(lfs, "sha256", None) if lfs is not None else None
+        if lfs_sha and lfs_sha.lower() != str(e["sha256"]).lower():
+            log(f"VERIFY_LFS_SHA_MISMATCH {e['name']}")
+            return False
+        log(f"VERIFY_OK {e['name']} size={got}")
+    # manifest.json re-hash via download (small file, direct read-back)
+    with tempfile.TemporaryDirectory(prefix="hfcuver.") as td:
+        local_manifest = Path(td) / "manifest.json"
+        api.hf_hub_download(
+            repo_id=repo_id, repo_type="model",
+            filename=f"{prefix}/manifest.json",
+            local_dir=td,
+        )
+        dpath = Path(td) / f"{prefix}" / "manifest.json"
+        if not dpath.is_file():
+            dpath = Path(td) / "manifest.json"
+        back = sha256_file(dpath)
+        if back.lower() != manifest_expected_sha.lower():
+            log(f"VERIFY_MANIFEST_SHA_MISMATCH want={manifest_expected_sha[:12]} got={back[:12]}")
+            return False
+    return True
+
+
+def audit_write(rec: dict) -> None:
+    audit_dir = Path(os.environ.get("VISION_AUDIT_DIR", Path.home() / "vision-audit"))
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    path = audit_dir / "upload-audit.jsonl"
+    with path.open("a") as f:
+        f.write(json.dumps(rec) + "\n")
+
+
+def die(code: int, msg: str) -> "int":
+    log(f"FAILED {msg}")
+    return code
+
+
+def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo-id", required=True)
     ap.add_argument("--step-dir", required=True)
@@ -64,128 +197,129 @@ def main() -> None:
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--tag", default="adapter")
     ap.add_argument("--dry-run", action="store_true")
-    args = ap.parse_args()
+    ap.add_argument("--skip-manifest-check", action="store_true",
+                    help="never used; reserved")
+    args = ap.parse_args(argv)
+
+    step_dir = Path(args.step_dir).resolve()
+    prefix = f"checkpoints/step-{args.step:07d}-{args.run_id}"
+    if args.tag:
+        prefix += f"-{args.tag}"
+
+    try:
+        files = collect_files(step_dir)
+    except Exception as e:
+        return die(2, redact(e, []))
+
+    entries = [
+        {"name": p.name, "size": p.stat().st_size, "sha256": sha256_file(p)}
+        for p in files
+    ]
+    total = sum(e["size"] for e in entries)
+    log(f"PLAN step={args.step} tag={args.tag} files={len(entries)} bytes={total} ({human(total)})")
+    for e in entries:
+        log(f"  {e['name']} {e['size']} {e['sha256'][:12]}")
+    log(f"PREFIX {prefix}")
+
+    if args.dry_run:
+        # manifest generated in a temp dir OUTSIDE the source dir to prove no mutation
+        with tempfile.TemporaryDirectory(prefix="hfcudry.") as td:
+            manifest = build_manifest(args.run_id, args.step, args.tag,
+                                      args.repo_id, files, step_dir)
+            (Path(td) / "manifest.json").write_text(
+                json.dumps(manifest, indent=2, sort_keys=True))
+            log(f"DRY_RUN ok offline; manifest staged in temp dir {Path(td).name}")
+        log("DRY_RUN_VERIFIED_LOCAL_ONLY")
+        return 0
 
     token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
     if not token:
-        die(4, "NO_TOKEN_IN_ENV")
+        audit_write({"ts": time.time(), "step": args.step, "run": args.run_id,
+                     "status": "failed_no_token", "prefix": prefix})
+        return die(4, "NO_TOKEN_IN_ENV")
+    secrets = [token]
 
-    step_dir = Path(args.step_dir).resolve()
-    if not step_dir.is_dir():
-        die(2, f"STEP_DIR_MISSING {step_dir}")
+    try:
+        from huggingface_hub import CommitOperationAdd, HfApi
+    except Exception as e:
+        return die(3, redact(("HUB_IMPORT_FAILED " + repr(e)), secrets))
 
-    files = sorted(
-        p for p in step_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in {
-            ".safetensors", ".pt", ".json", ".yaml", ".yml", ".txt", ".mp4", ".md",
-        }
-    )
-    if not files:
-        die(2, f"NO_UPLOADABLE_FILES {step_dir}")
-
-    remote_prefix = f"checkpoints/step-{args.step:07d}-{args.run_id}"
-    if args.tag:
-        remote_prefix += f"-{args.tag}"
-
-    entries = []
-    for p in files:
-        entries.append({
-            "name": p.name,
-            "size": p.stat().st_size,
-            "sha256": sha256(p),
-        })
-    manifest = {
-        "run_id": args.run_id,
-        "step": args.step,
-        "tag": args.tag,
-        "repo_id": args.repo_id,
-        "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "files": entries,
-    }
-
-    total = sum(e["size"] for e in entries)
-    print(f"PLAN step={args.step} files={len(entries)} bytes={total} ({human(total)})")
-    for e in entries:
-        print(f"  {e['name']} {e['size']} {e['sha256'][:12]}")
-    manifest_path = step_dir / "manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
-    entries.append({"name": "manifest.json", "size": manifest_path.stat().st_size,
-                    "sha256": sha256(manifest_path)})
-
-    if args.dry_run:
-        print(f"DRY_RUN would upload prefix {remote_prefix}")
-        return
-
-    from huggingface_hub import HfApi  # deferred import
     api = HfApi(token=token)
+    try:
+        info = api.repo_info(repo_id=args.repo_id, repo_type="model")
+        if not getattr(info, "private", False):
+            return die(3, "REPO_NOT_PRIVATE_REFUSED")
+        sha_head = getattr(info, "sha", None)
+    except Exception as e:
+        audit_write({"ts": time.time(), "step": args.step, "run": args.run_id,
+                     "status": "failed_repo_info", "prefix": prefix})
+        return die(3, redact("REPO_INFO_FAILED " + repr(e), secrets))
 
-    # Append-only guard: refuse if target prefix already populated.
     try:
         existing = api.list_repo_files(repo_id=args.repo_id, repo_type="model")
     except Exception as e:
-        die(3, f"LIST_FAILED {type(e).__name__}: {str(e)[:200]}")
-    clash = [k for k in existing if k.startswith(remote_prefix + "/")]
+        return die(3, redact("LIST_FAILED " + repr(e), secrets))
+    clash = detect_prefix_clash(existing, prefix)
     if clash:
-        die(3, f"APPEND_ONLY_CLASH prefix exists with {len(clash)} files "
-                f"first={clash[0]}")
+        return die(3, f"APPEND_ONLY_CLASH existing_files={len(clash)} first={clash[0]}")
 
-    # Stage files in a temp dir so remote layout is exactly remote_prefix/<name>.
-    with tempfile.TemporaryDirectory(prefix="hfcu.") as td:
-        staging = Path(td) / "payload"
-        staging.mkdir()
-        for e in entries:
-            src = manifest_path if e["name"] == "manifest.json" else step_dir / e["name"]
-            shutil.copy2(src, staging / e["name"])
+    manifest = build_manifest(args.run_id, args.step, args.tag,
+                              args.repo_id, files, step_dir)
+    manifest_blob = json.dumps(manifest, indent=2, sort_keys=True).encode()
+    manifest_sha = hashlib.sha256(manifest_blob).hexdigest()
 
-        last_err = None
-        for attempt in range(1, RETRY_ATTEMPTS + 1):
-            try:
-                t0 = time.time()
-                api.upload_folder(
-                    folder_path=str(staging),
-                    repo_id=args.repo_id,
-                    repo_type="model",
-                    path_in_repo=remote_prefix,
-                    commit_message=f"ckp step-{args.step:07d} run-{args.run_id} ({args.tag})",
-                    etag_timeout=60,
-                )
-                print(f"UPLOAD_OK attempt={attempt} seconds={time.time() - t0:.1f}")
-                break
-            except Exception as e:
-                last_err = e
-                print(f"RETRY attempt={attempt} {type(e).__name__}: {str(e)[:200]}")
-                time.sleep(RETRY_BACKOFF * attempt)
-        else:
-            die(3, f"UPLOAD_RETRIES_EXHAUSTED {type(last_err).__name__}")
+    with tempfile.TemporaryDirectory(prefix="hfcumani.") as td:
+        mpath = Path(td) / "manifest.json"
+        mpath.write_bytes(manifest_blob)
 
-    # Verification: paths + sizes.
+        ops = [
+            CommitOperationAdd(path_or_fileobj=str(p), path_in_repo=f"{prefix}/{p.name}")
+            for p in files
+        ]
+        ops.append(
+            CommitOperationAdd(path_or_fileobj=str(mpath), path_in_repo=f"{prefix}/manifest.json")
+        )
+
+        # Exactly ONE commit attempt. Uncertain commits are NEVER retried here.
+        try:
+            t0 = time.time()
+            api.create_commit(
+                repo_id=args.repo_id,
+                repo_type="model",
+                operations=ops,
+                commit_message=f"ckp step-{args.step:07d} run-{args.run_id} ({args.tag})",
+                parent_commit=sha_head,
+            )
+            log(f"COMMIT_OK seconds={time.time() - t0:.1f}")
+        except Exception as e:
+            audit_write({"ts": time.time(), "step": args.step, "run": args.run_id,
+                         "status": "uncertain_commit", "prefix": prefix,
+                         "err": redact(e, secrets)})
+            return die(3, redact("UNCERTAIN_COMMIT no auto-retry; rerun gets a fresh prefix. " + repr(e), secrets))
+
+    entries_with_manifest = entries + [{
+        "name": "manifest.json", "size": len(manifest_blob), "sha256": manifest_sha,
+    }]
     try:
-        infos = api.get_paths_info(repo_id=args.repo_id, repo_type="model",
-                                   paths=[f"{remote_prefix}/{e['name']}" for e in entries])
-        ok = True
-        for e in entries:
-            want = e["size"]
-            got = None
-            for info in infos:
-                if getattr(info, "path", None) == f"{remote_prefix}/{e['name']}":
-                    got = getattr(info, "lfs", None) or getattr(info, "blob", None)
-                    got = getattr(got, "size", None) or getattr(got, "size", None)
-                    break
-            status = "ok" if (got == want and got is not None) else f"MISMATCH want={want} got={got}"
-            if status != "ok":
-                ok = False
-            print(f"  VERIFY {e['name']} {status}")
-        if not ok:
-            die(3, "VERIFY_MISMATCH — do NOT trust this checkpoint; use -r2 retry dir")
-        print("UPLOAD_VERIFIED")
+        ok = verify_remote(api, args.repo_id, prefix, entries_with_manifest,
+                           manifest_expected_sha=manifest_sha, secrets=secrets)
     except Exception as e:
-        die(3, f"VERIFY_ERROR {type(e).__name__}: {str(e)[:200]}")
+        audit_write({"ts": time.time(), "step": args.step, "run": args.run_id,
+                     "status": "verification_error", "prefix": prefix,
+                     "err": redact(e, secrets)})
+        return die(3, redact("VERIFY_ERROR " + repr(e), secrets))
 
-    rec = {"ts": time.time(), "repo": args.repo_id, "step": args.step, "run": args.run_id,
-           "files": [e["name"] for e in entries], "bytes": total, "status": "verified"}
-    with AUDIT_LOG.open("a") as f:
-        f.write(json.dumps(rec) + "\n")
+    if not ok:
+        audit_write({"ts": time.time(), "step": args.step, "run": args.run_id,
+                     "status": "verification_failed", "prefix": prefix})
+        return die(3, "VERIFY_NOT_VERIFIED — treat as FAILED; rerun uses fresh prefix")
+
+    audit_write({"ts": time.time(), "step": args.step, "run": args.run_id,
+                 "status": "verified", "prefix": prefix, "bytes": total,
+                 "repo": args.repo_id})
+    log("UPLOAD_VERIFIED")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
