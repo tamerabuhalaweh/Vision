@@ -1,0 +1,32 @@
+# Local environment files (tokens live under the owner's Windows profile, never here)
+.env
+*.env
+!env.example
+*.token
+*_token.txt
+TOKEN*
+SECRETS*
+
+# Datasets and weights — never mirrored to GitHub
+data/
+datasets/
+weights/
+checkpoints/
+runs/
+outputs/
+samples/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.gguf
+*.mp4
+*.mov
+*.mkv
+
+# Caches
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
