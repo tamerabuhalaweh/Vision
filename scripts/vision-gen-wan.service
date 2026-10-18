@@ -1,0 +1,16 @@
+[Unit]
+Description=Vision WAN TI2V-5B baseline dataset generator (persistent, supervised)
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=20
+ExecStart=/home/administrator/vision-work/venv-wan/bin/python /home/administrator/vision-work/scripts/vision_gen_batch.py
+WorkingDirectory=/home/administrator/vision-work
+TimeoutStartSec=0
+StandardOutput=append:/home/administrator/vision-work/logs/gen-wan.log
+StandardError=append:/home/administrator/vision-work/logs/gen-wan.log
+
+[Install]
+WantedBy=default.target
