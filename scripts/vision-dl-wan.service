@@ -1,0 +1,14 @@
+[Unit]
+Description=Vision WAN2.2-TI2V-5B downloader (persistent, supervised)
+After=network-online.target
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=15
+ExecStart=/home/administrator/vision-work/venv-hf/bin/python /home/administrator/vision-work/scripts/vision_dl_wan.py
+WorkingDirectory=/home/administrator/vision-work
+TimeoutStartSec=0
+
+[Install]
+WantedBy=default.target
